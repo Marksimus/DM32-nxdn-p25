@@ -24,6 +24,7 @@ Firmware abierto y multimodo para el **Baofeng DM-32UV**: FM, DMR, **APCO P25 fa
 | Tono de permiso estilo Motorola | P25/NXDN: TPT ASTRO 25 (3 bips de 910 Hz); DMR: chirp MOTOTRBO |
 | Tema «Rosa» | Tema claro rosa (Ajustes › Pantalla › Tema › Rosa) |
 | AM de aviación (108-136 MHz) | El squelch abre con los niveles 1-9 (antes solo con 0). Probado en la radio |
+| AM: audio saturado | Candidato `0046`: control de ganancia con techo en el nivel anterior, recuperación acotada y compensación del squelch. Pruebas de software; pendiente de comparación de audio en la radio |
 | Recepción ampliada | Solo RX: 174-260, 350-400 y 480-520 MHz, con menos sensibilidad fuera de los filtros. TX sigue en 136-174 / 400-480 |
 
 ## Hotspots, repetidores y otras radios
@@ -40,6 +41,11 @@ de arranque y el VFO FM/DMR/P25/NXDN. La versión retirada deja de ser estable y
 
 **Esto revierte el empeoramiento; no da por resuelta la distorsión original con aviones cercanos.** El siguiente
 ajuste de AM necesita una comparación física antes de recomendarlo. Véase [el diagnóstico](docs/am-regression.md).
+
+El candidato `0046` reduce la ganancia ante señales fuertes sin superar la ganancia de la versión anterior. Corrige
+el promedio entre muestras tomadas con ganancias distintas y la recuperación lenta. Conserva el filtro, la salida
+AM y el squelch anteriores. **La mejora del audio está pendiente de comprobar en la radio**; este cambio no vuelve
+a recomendar el hotfix retirado.
 
 ## Hotfix — DMR PTT, boot screen, and four-mode VFO
 
@@ -73,6 +79,7 @@ Parches de la serie (`integration/radiofoundry/patches/`):
 
 | Parche | Qué hace |
 |---|---|
+| `0046-am-bounded-receive-gain` | AM: reduce ganancia con señales fuertes, descarta muestras de la ganancia anterior, recupera sin una espera por cada escalón y compensa el RSSI del squelch. Mantiene como techo la ganancia previa y la restaura al salir de AM. Candidato pendiente de prueba de audio en la radio |
 | `0009-digital-voice-status-recovery-and-credits` | Re-selección de canal digital sin perder la sesión, recuperación automática tras fallos del módem, pantalla «Digital: iniciando / fallo del módem» honesta, créditos |
 | `0010-nxdn-fm-tx-ram` | TX NXDN por la TX RAM del HR_C7000: la que hace que la TX NXDN se decodifique |
 | `0011-motorola-talk-permit` | Tono de permiso para hablar como Motorola; en P25/NXDN suena antes de dar portadora |
@@ -109,6 +116,9 @@ Parches de la serie (`integration/radiofoundry/patches/`):
 Fuera de la serie: recepción NXDN corregida (filtros del FD6818 en la ruta plana, FSW en ambas polaridades, ganancia AF) en `integration/radiofoundry/nxdn/` y `src/nxdn/`.
 
 ## Compilar
+
+El control de ganancia AM se comprueba con `python3 tools/test_am.py`: driver con AM activado y desactivado,
+ASan/UBSan, modelo de señal fuerte/débil y restauración de registros al cambiar de modo.
 
 Requiere Linux (o WSL) y el toolchain C-SKY que se construye localmente; ver [docs/build.md](docs/build.md). La imagen de la release se generó con:
 
