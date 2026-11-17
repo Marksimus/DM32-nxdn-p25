@@ -1,0 +1,376 @@
+--- a/drivers/rf/fd6818/fd6818.h
++++ b/drivers/rf/fd6818/fd6818.h
+@@ -12,6 +12,7 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include "rf/rfbus/rfbus.h"
++#include "config.h"
+ 
+ 
+ typedef rfbus_regval_t fd6818_regval_t;
+@@ -48,18 +49,31 @@
+ 
+ extern const fd6818_variant_t fd6818_variant_default;
+ 
++#if CONFIG_AM_RX
++typedef struct {
++	uint16_t prev;
++	uint8_t idx, ceiling, hold;
++} fd6818_agc_t;
++#endif
++
+ typedef struct {
+ 	rfbus_t *bus;
+ 	const fd6818_variant_t *variant;
+ 	uint32_t freq_10hz;	// last frequency written, 10 Hz units (0 = none)
+ 	uint16_t bw_reg;	// last 0x43 value
+ 	uint16_t state;		// last 0x30 value
++#if CONFIG_AM_RX
++	bool am;
++	uint16_t am_gain_saved;
++	fd6818_agc_t agc;
++#endif
+ } fd6818_t;
+ 
+ // Registers with a known meaning
+ #define FD6818_REG_CTCSS_FREQ	0x07
+ #define FD6818_REG_DCS_CODE	0x08	// DCS word, low then high 12 bits (bit 15 marks the high half)
+ #define FD6818_REG_CSS_STATUS	0x0C	// b10 CTCSS, b14 DCS normal, b15 DCS inverted detected
++#define FD6818_REG_GAIN		0x13
+ #define FD6818_REG_BAND_A	0x1A
+ #define FD6818_REG_STATE	0x30
+ #define FD6818_REG_POWER	0x37	// block enables: 0x1F0F receive, 0x1D11 / 0x1D00 receiver asleep (FM / DMR)
+@@ -155,9 +169,20 @@
+ // also turns the chip's sub-audio transmitter on, so a radio that makes its tones elsewhere sets NONE before TX
+ void fd6818_set_rx_tone(fd6818_t *dev, fd6818_tone_t type, uint16_t value);
+ bool fd6818_rx_tone_ok(fd6818_t *dev, fd6818_tone_t type);
+-// The receiver's audio output: the AM demodulator (true, the air band) or FM. Only the AF word changes: tune and set the
+-// FM bandwidth and RX state as for FM receive. fd6818_set_mode writes FM again
++// The receiver's audio output: AM or FM. AM gain starts at the existing receive gain, never above it, and is reset
++// on every tune. Leaving AM restores that gain before selecting FM. The filter and AF control words stay unchanged.
+ void fd6818_set_am(fd6818_t *dev, bool am);
++#if CONFIG_AM_RX
++#define FD6818_AGC_TARGET	142u
++#define FD6818_AGC_HOLD		30u	// status polls before recovering gain after a strong signal
++// A known 0x13 word sets the gain ceiling; an unknown word disables automatic gain without changing it.
++bool fd6818_agc_reset(fd6818_agc_t *a, uint16_t ceiling_word);
++bool fd6818_agc_step(fd6818_agc_t *a, uint16_t r67);
++uint16_t fd6818_agc_word(const fd6818_agc_t *a);
++uint8_t fd6818_agc_atten_db(const fd6818_agc_t *a);
++// Advance AM gain and return the attenuation at which this RSSI sample was taken, for squelch compensation.
++uint8_t fd6818_am_status(fd6818_t *dev, uint16_t r67);
++#endif
+ // Receiver power saving (8.8, the radio's own sequence): sleep = idle, then 0x37 to its low-power word (FM 0x1D11,
+ // DMR 0x1D00); wake = 0x37 back to the receive word (0x1F1F, then 0x1F0F) with the state still idle: the caller
+ // retunes and sets the RX state next (fd6818_set_freq, fd6818_set_state)
+--- a/drivers/rf/fd6818/fd6818.c
++++ b/drivers/rf/fd6818/fd6818.c
+@@ -128,6 +128,11 @@
+ 	dev->freq_10hz = 0;
+ 	dev->bw_reg = 0;
+ 	dev->state = 0;
++#if CONFIG_AM_RX
++	dev->am = false;
++	dev->am_gain_saved = 0;
++	(void)fd6818_agc_reset(&dev->agc, 0xFFFFu);
++#endif
+ }
+ 
+ void fd6818_write(fd6818_t *dev, uint8_t reg, uint16_t val)
+@@ -168,6 +173,11 @@
+ void fd6818_set_mode(fd6818_t *dev, fd6818_mode_t mode)
+ {
+ 	const fd6818_variant_t *v = dev->variant;
++#if CONFIG_AM_RX
++	if (dev->am) {
++		fd6818_set_am(dev, false);
++	}
++#endif
+ 	if (mode == FD6818_MODE_DMR) {
+ 		if (v->dmr != NULL) {
+ 			write_table(dev, v->dmr, v->dmr_n);
+@@ -281,8 +291,112 @@
+ 
+ void fd6818_set_am(fd6818_t *dev, bool am)
+ {
++#if CONFIG_AM_RX
++	if (am) {
++		if (!dev->am) {
++			dev->am_gain_saved = fd6818_read(dev, FD6818_REG_GAIN);
++		} else if (fd6818_agc_atten_db(&dev->agc) != 0) {
++			fd6818_write(dev, FD6818_REG_GAIN, dev->am_gain_saved);
++		}
++		(void)fd6818_agc_reset(&dev->agc, dev->am_gain_saved);
++	} else if (dev->am && fd6818_agc_atten_db(&dev->agc) != 0) {
++		fd6818_write(dev, FD6818_REG_GAIN, dev->am_gain_saved);
++	}
++	dev->am = am;
++#endif
+ 	fd6818_write(dev, FD6818_REG_AF, am ? FD6818_AF_AM : FD6818_AF_FM);
+ }
++
++#if CONFIG_AM_RX
++// FD6818 0x13 gain steps, relative to 0x03FF (RadioFoundry ad79ab67, hardware-dm32.md 8.7).
++// The ceiling is the word already in use, so weak signals keep their previous gain, rather than gaining 12 dB.
++static const struct {
++	uint16_t word;
++	int8_t db;
++} agc_table[] = {
++	{ 0x000, -93 }, { 0x008, -91 }, { 0x010, -88 }, { 0x001, -87 }, { 0x009, -85 }, { 0x011, -82 }, { 0x002, -81 },
++	{ 0x00A, -79 }, { 0x012, -76 }, { 0x003, -75 }, { 0x00B, -73 }, { 0x013, -70 }, { 0x004, -69 }, { 0x00C, -67 },
++	{ 0x00D, -64 }, { 0x01C, -61 }, { 0x01D, -58 }, { 0x01E, -55 }, { 0x01F, -52 }, { 0x03E, -50 }, { 0x03F, -47 },
++	{ 0x05E, -45 }, { 0x05F, -42 }, { 0x07E, -40 }, { 0x07F, -37 }, { 0x09F, -34 }, { 0x0BF, -32 }, { 0x0DF, -30 },
++	{ 0x0FF, -28 }, { 0x1DF, -26 }, { 0x1FF, -24 }, { 0x2BF, -23 }, { 0x2DF, -21 }, { 0x2FF, -19 }, { 0x35E, -17 },
++	{ 0x35F, -14 }, { 0x37E, -12 }, { 0x37F, -9 }, { 0x38F, -6 }, { 0x3BF, -4 }, { 0x3DF, -2 }, { 0x3FF, 0 },
++};
++#define AGC_N		(uint8_t)(sizeof(agc_table) / sizeof(agc_table[0]))
++#define AGC_NO_PREV	0xFFFFu
++#define AGC_DISABLED	0xFFu
++#define AGC_RELEASE_MARGIN	12u	// 6 dB hysteresis in the RSSI's 0.5 dB units
++
++bool fd6818_agc_reset(fd6818_agc_t *a, uint16_t ceiling_word)
++{
++	a->idx = 0;
++	a->ceiling = AGC_DISABLED;
++	a->hold = 0;
++	a->prev = AGC_NO_PREV;
++	for (uint8_t i = 0; i < AGC_N; i++) {
++		if (agc_table[i].word == ceiling_word) {
++			a->idx = a->ceiling = i;
++			return true;
++		}
++	}
++	return false;
++}
++
++bool fd6818_agc_step(fd6818_agc_t *a, uint16_t r67)
++{
++	if (a->ceiling == AGC_DISABLED) {
++		return false;
++	}
++	uint16_t raw = r67 & 0x1FFu;
++	uint16_t avg = a->prev == AGC_NO_PREV ? raw : (uint16_t)((raw + a->prev) / 2u);
++	a->prev = raw;
++	uint8_t idx = a->idx;
++	if (a->hold > 0) {
++		a->hold--;
++	}
++	if (avg >= FD6818_AGC_TARGET + 2u) {
++		int want = agc_table[idx].db - (int)((avg - FD6818_AGC_TARGET) / 2u);
++		while (idx > 0 && agc_table[idx].db > want) {
++			idx--;
++		}
++		a->hold = FD6818_AGC_HOLD;
++	} else if (avg + AGC_RELEASE_MARGIN < FD6818_AGC_TARGET) {
++		if (a->hold == 0 && idx < a->ceiling) {
++			idx++;
++		}
++	} else {
++		a->hold = FD6818_AGC_HOLD;
++	}
++	bool changed = idx != a->idx;
++	a->idx = idx;
++	if (changed) {
++		// The next reading is at a different gain. Mixing it with the old reading caused repeated excess cuts.
++		a->prev = AGC_NO_PREV;
++	}
++	return changed;
++}
++
++uint16_t fd6818_agc_word(const fd6818_agc_t *a)
++{
++	return agc_table[a->idx].word;
++}
++
++uint8_t fd6818_agc_atten_db(const fd6818_agc_t *a)
++{
++	return a->ceiling == AGC_DISABLED ? 0u : (uint8_t)(agc_table[a->ceiling].db - agc_table[a->idx].db);
++}
++
++uint8_t fd6818_am_status(fd6818_t *dev, uint16_t r67)
++{
++	if (!dev->am) {
++		return 0;
++	}
++	uint8_t atten = fd6818_agc_atten_db(&dev->agc);
++	if (fd6818_agc_step(&dev->agc, r67)) {
++		fd6818_write(dev, FD6818_REG_GAIN, fd6818_agc_word(&dev->agc));
++	}
++	return atten;
++}
++#endif
+ 
+ void fd6818_rx_sleep(fd6818_t *dev, bool sleep, fd6818_mode_t mode)
+ {
+--- a/boards/dm32/radio_dm32.c
++++ b/boards/dm32/radio_dm32.c
+@@ -308,10 +308,8 @@
+ 		// The FD6818 detects the tone on its own demodulated audio: the C7000's detector gets no audio while the
+ 		// FD6818 plays FM to the speaker (hardware-dm32.md 8.4)
+ 		fd6818_set_rx_tone(&fd, fd_tone(tone != NULL ? tone->type : TONE_NONE), tone != NULL ? tone->value : 0);
+-		if (am != rx_am_on) {
+-			fd6818_set_am(&fd, am);
+-			rx_am_on = am;
+-		}
++		fd6818_set_am(&fd, am);	// reset the gain ceiling for each tuned channel
++		rx_am_on = am;
+ 	}
+ 	rx_hz = hz;
+ 	rx_bw = bw;
+@@ -468,6 +466,12 @@
+ 	last_rssi_raw = fd6818_rssi_raw(r67);
+ 	last_noise_raw = r65 & 0xFFu;
+ 	st->rssi_dbm = (int16_t)(fd6818_rssi_dbm(r67) + (rx_am_on ? AM_RSSI_DB : 0));
++#if CONFIG_AM_RX
++	if (rx_am_on && !asleep && !transmitting) {
++		// Compensate using the gain at the sample, before the loop changes it, so AGC cannot close the squelch.
++		st->rssi_dbm = (int16_t)(st->rssi_dbm + fd6818_am_status(&fd, r67));
++	}
++#endif
+ 	st->noise = fd6818_noise(r65);	// the chip's floor lifted above the core's squelch levels (fd6818.h)
+ 	st->carrier = false;
+ 	st->tone_ok = mode != RADIO_MODE_FM || fd6818_rx_tone_ok(&fd, fd_tone(rx_tone.type));
+--- a/tests/host/fd6818Test.c
++++ b/tests/host/fd6818Test.c
+@@ -310,6 +310,102 @@
+ 	CHECK(i >= 0 && chip.log[i].val == FD6818_AF_FM);
+ 	CHECK(chip.protocol_errors == 0);
+ }
++
++#if CONFIG_AM_RX
++// The receiver model follows every applied gain step. Constant-RSSI tests alone missed the withdrawn AM loop's
++// extra cuts and slow recovery: the sample before a gain change must not be averaged with the sample after it.
++static uint16_t am_reading(const fd6818_agc_t *a, int source)
++{
++	int raw = source - 2 * fd6818_agc_atten_db(a);
++	return (uint16_t)(raw < 0 ? 0 : raw > 511 ? 511 : raw);
++}
++
++static void test_am_agc(void)
++{
++	fd6818_agc_t a;
++	CHECK(fd6818_agc_reset(&a, 0x037E));
++	CHECK(fd6818_agc_atten_db(&a) == 0 && fd6818_agc_word(&a) == 0x037E);
++	CHECK(fd6818_agc_step(&a, 222));
++	CHECK(fd6818_agc_atten_db(&a) == 40);
++	CHECK(!fd6818_agc_step(&a, 142));	// no second cut from the old, high-gain reading
++	CHECK(fd6818_agc_atten_db(&a) == 40);
++
++	for (int source = 0; source <= 511; source++) {
++		CHECK(fd6818_agc_reset(&a, 0x037E));
++		for (int k = 0; k < 120; k++) {
++			(void)fd6818_agc_step(&a, am_reading(&a, source));
++			CHECK(a.idx <= a.ceiling && fd6818_agc_atten_db(&a) <= 81);
++		}
++		if (source <= 143) {
++			CHECK(fd6818_agc_atten_db(&a) == 0);	// no boost and no attenuation of weak stations
++		} else if (source <= 304) {
++			CHECK(am_reading(&a, source) >= 136 && am_reading(&a, source) <= 143);
++		} else {
++			CHECK(fd6818_agc_atten_db(&a) == 81);	// table bound, never an index wrap
++		}
++		uint8_t settled = a.idx;
++		for (int k = 0; k < 60; k++) {
++			CHECK(!fd6818_agc_step(&a, am_reading(&a, source)));
++			CHECK(a.idx == settled);	// no steady-state gain pumping
++		}
++	}
++
++	CHECK(fd6818_agc_reset(&a, 0x037E));
++	for (int k = 0; k < 20; k++) {
++		(void)fd6818_agc_step(&a, am_reading(&a, 260));
++	}
++	CHECK(fd6818_agc_atten_db(&a) == 61);
++	unsigned recovered = 0;
++	while (fd6818_agc_atten_db(&a) && recovered < 80) {
++		(void)fd6818_agc_step(&a, am_reading(&a, 120));
++		recovered++;
++	}
++	CHECK(recovered <= FD6818_AGC_HOLD + 42 && fd6818_agc_word(&a) == 0x037E);
++	for (int k = 0; k < 100; k++) {
++		CHECK(!fd6818_agc_step(&a, 0));
++		CHECK(fd6818_agc_word(&a) == 0x037E);
++	}
++	// Unknown gain words are preserved. High, non-RSSI bits do not change the result.
++	CHECK(!fd6818_agc_reset(&a, 0x1234));
++	CHECK(!fd6818_agc_step(&a, 511) && fd6818_agc_atten_db(&a) == 0);
++	CHECK(fd6818_agc_reset(&a, 0x03DF));
++	CHECK(fd6818_agc_step(&a, (uint16_t)(0xFE00u | 222u)));
++	CHECK(fd6818_agc_atten_db(&a) >= 40);
++}
++
++static void test_am_gain_restore(void)
++{
++	fd6818_t dev;
++	reset_chip();
++	fd6818_attach(&dev, bus());
++	fd6818_set_mode(&dev, FD6818_MODE_FM);
++	fd6818_set_bandwidth(&dev, FD6818_BW_FM_12K5);
++	chip.regs[0x4A] = 0x4567;
++	fd6818_set_am(&dev, true);
++	CHECK(chip.regs[0x13] == 0x037E);
++	CHECK(chip.regs[0x47] == 0x0740 && chip.regs[0x43] == 0x4008);
++	CHECK(chip.regs[0x4A] == 0x4567 && chip.regs[0x48] == 0xBBBF);
++	chip.n = 0;
++	CHECK(fd6818_am_status(&dev, 222) == 0);	// compensation belongs to the gain BEFORE this poll's cut
++	CHECK(chip.n == 1 && chip.log[0].reg == FD6818_REG_GAIN && chip.log[0].val == 0x001F);
++	CHECK(fd6818_am_status(&dev, 142) == 40);
++	CHECK(chip.n == 1);	// no stale-average overcut
++	CHECK(fd6818_rssi_dbm(222) == fd6818_rssi_dbm(142) + 40);	// same squelch level after the cut
++	fd6818_set_am(&dev, true);	// another AM tune starts at the original ceiling, not the attenuated one
++	CHECK(chip.regs[0x13] == 0x037E && fd6818_agc_atten_db(&dev.agc) == 0);
++	(void)fd6818_am_status(&dev, 260);
++	fd6818_set_am(&dev, false);
++	CHECK(chip.regs[0x13] == 0x037E && chip.regs[0x47] == 0x0140);
++	chip.n = 0;
++	CHECK(fd6818_am_status(&dev, 511) == 0 && chip.n == 0);
++	fd6818_set_am(&dev, true);
++	(void)fd6818_am_status(&dev, 260);
++	fd6818_set_mode(&dev, FD6818_MODE_DMR);
++	CHECK(!dev.am && chip.regs[0x13] == 0x037E && chip.regs[0x47] == 0x0140);
++	CHECK(chip.regs[0x43] == FD6818_BW_DMR && chip.regs[0x4A] == 0x4567);
++	CHECK(chip.protocol_errors == 0);
++}
++#endif
+ 
+ // RX sub-audio set-up in the radio's own order, and the 0x0C detect bits
+ static void test_rx_tones(void)
+@@ -486,6 +582,10 @@
+ 	test_rx_tones();
+ 	test_rx_sleep();
+ 	test_am();
++#if CONFIG_AM_RX
++	test_am_agc();
++	test_am_gain_restore();
++#endif
+ 	if (failures) {
+ 		printf("fd6818Test: %d failures\n", failures);
+ 		return 1;
+--- a/docs/spec/airband-and-broadcast.md
++++ b/docs/spec/airband-and-broadcast.md
+@@ -65,6 +65,13 @@
+ RSSI in dBm (noise isn't used in AM) and `tone_ok = true`. `tx()` is never called while AM is on. NULL = no AM.
+ On an FD6818 `rx_am` is `rx` plus the AF output type AM (`fd6818_set_am`, 0x47 = 0x0740; inferred, section 2);
+ `rx()` and `set_mode()` write FM back.
++
++The derivative's receive-gain candidate keeps this AF and filter setup. On a receiver using `fd6818_am_status`,
++the gain ceiling is the word read before entering AM; unknown words disable gain changes. Each status poll reduces
++gain above raw RSSI 143, holds it in the target band, and recovers one table entry per poll below 130 after a
++30-poll hold. Gain changes discard the previous RSSI sample. The board adds the attenuation at the sample's gain
++back to RSSI before the core's existing AM squelch mapping. Each AM tune resets to the saved ceiling; leaving AM
++restores it. The board skips gain updates during receiver sleep or transmit. Physical audio validation is pending.
+ 
+ ## 4. Broadcast FM
+ 
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -314,6 +314,9 @@
+ 
+ ## Air band and FM broadcast
+ 
++The derivative's AM gain-control candidate reduces receiver gain for strong signals and restores it for weaker
++ones. It needs no setting. Its effect on saturated audio still needs a comparison on the radio.
++
+ Some radios also receive the aircraft band in AM and FM broadcast stations ([Radio reference](23-radios.md)). There is
+ no mode to pick and no menu: the frequency decides.
+ 
