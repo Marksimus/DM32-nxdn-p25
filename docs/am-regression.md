@@ -42,3 +42,33 @@ Before recommending a new AM change, compare the same source, frequency, volume 
 and candidate versions. Record whether squelch 0 removes the cuts, the RF/noise and gain readings, and the audio
 at controlled weak and strong levels. Change one receive component at a time. No aircraft-band RF is emitted
 and no radio is flashed as part of this rollback task.
+
+## Gain-only candidate (November 16)
+
+The owner describes the current audio as saturated. The rollback still selects AM with `0x47 = 0x0740` and leaves
+`0x13 = 0x037E` fixed. A strong signal therefore has no software gain reduction. This is a plausible source of
+overload, not a measured diagnosis of the owner's audio. AF output clipping and front-end overload remain possible.
+
+Patch `0046-am-bounded-receive-gain` changes only the receive gain control. It does not reinstate the withdrawn
+filter, AF control, full-gain boost, `0x4A`, or noise-based squelch changes:
+
+- Use the permissively licensed FD6818 gain table and target from RadioFoundry `ad79ab67` / `dc1140bf`.
+- Start at the existing gain word and use it as a ceiling. On this board that is `0x037E`; never boost to `0x03FF`.
+  If a gain word is unknown, preserve it and disable gain changes.
+- Reduce gain to bring a strong reading to the target in one step. Discard the averaging history after every gain
+  change: the next sample was measured at a different gain.
+- After the hold, recover one table entry per status poll, without restarting the hold on each recovery step.
+- Add back the attenuation at which each RSSI sample was taken, before updating the gain. Keep the existing AM
+  RSSI offset and squelch mapping, so reducing gain does not itself mute the audio.
+- Reset the gain on every AM tune and restore the previous word on leaving AM, including a direct change to DMR.
+  Do not advance the loop while the receiver sleeps or transmits.
+
+The host regression models a receiver whose RSSI follows the applied gain, including every input reading from
+0 through 511, steady signals, the gain-table bounds, a strong-to-weak step, retuning, and leaving AM. At the
+modeled strong reading 260, the gain reduction is 61 dB; after the source drops to 120, full original gain returns
+in 55 status polls (1.375 s at 25 ms per poll). This is a software-model result, not a timing or audio measurement
+on the radio. The withdrawn loop's stale-average double cut is a separate explicit regression.
+
+The candidate requires the same physical comparison described above before promotion to a public stable release.
+In particular, compare squelch 0 and 5 with the same station, antenna and volume, and check FM and DMR after AM.
+No radio or RF bench is connected to this change's software validation.
