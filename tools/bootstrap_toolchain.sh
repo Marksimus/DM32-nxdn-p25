@@ -25,7 +25,9 @@ fi
 (
     cd research/toolchain/gcc-14.3.0
     # This pinned release script verifies its prerequisite archives with SHA-512.
-    ./contrib/download_prerequisites --no-isl > "$task_root/logs/gcc-prerequisites.log" 2>&1
+    # If gcc.gnu.org is unreachable, GCC falls back to the system GMP/MPFR/MPC the workflow installs.
+    ./contrib/download_prerequisites --no-isl > "$task_root/logs/gcc-prerequisites.log" 2>&1 ||
+        echo "GCC prerequisite download failed; using system GMP/MPFR/MPC"
 )
 (
     cd build/gcc

@@ -6,7 +6,8 @@ task_root=$(pwd)
 task_archive="$task_root/research/toolchain/downloads/newlib-4.5.0.20241231.tar.gz"
 mkdir -p research/toolchain/downloads build/newlib logs
 if [ ! -f "$task_archive" ]; then
-    curl -fL https://sourceware.org/pub/newlib/newlib-4.5.0.20241231.tar.gz -o "$task_archive"
+    curl -fL --retry 4 --retry-all-errors --connect-timeout 30 https://sourceware.org/pub/newlib/newlib-4.5.0.20241231.tar.gz -o "$task_archive" ||
+        curl -fL --retry 4 --retry-all-errors --connect-timeout 30 https://mirrors.kernel.org/sourceware/newlib/newlib-4.5.0.20241231.tar.gz -o "$task_archive"
 fi
 python3 - "$task_archive" <<'PY'
 import hashlib, sys

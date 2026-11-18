@@ -109,9 +109,31 @@ def fetch_or_verify(fetch, only=None):
         if not path.exists() and fetch:
             path.parent.mkdir(parents=True, exist_ok=True)
             partial = path.with_name(path.name + '.partial')
-            with urllib.request.urlopen(f['url'], timeout=60) as incoming, partial.open('xb') as out:
-                for data in iter(lambda: incoming.read(1 << 20), b''):
-                    out.write(data)
+            # ftp.gnu.org is sometimes unreachable from CI: fall back to official GNU mirrors.
+            # Safe because every download is checked against the pinned SHA-256 below.
+            urls = [f['url']]
+            gnu = 'https://ftp.gnu.org/gnu/'
+            if f['url'].startswith(gnu):
+                tail = f['url'][len(gnu):]
+                urls += ['https://mirrors.kernel.org/gnu/' + tail,
+                         'https://ftpmirror.gnu.org/' + tail,
+                         'https://mirrors.ocf.berkeley.edu/gnu/' + tail]
+            last_error = None
+            for url in urls * 2:
+                try:
+                    if partial.exists():
+                        partial.unlink()
+                    print('downloading', url, flush=True)
+                    with urllib.request.urlopen(url, timeout=120) as incoming, partial.open('xb') as out:
+                        for data in iter(lambda: incoming.read(1 << 20), b''):
+                            out.write(data)
+                    last_error = None
+                    break
+                except OSError as error:
+                    last_error = error
+                    print('download failed:', url, error, file=sys.stderr, flush=True)
+            if last_error is not None:
+                raise last_error
             if sha_file(partial) != f['sha256'] or partial.stat().st_size != f['bytes']:
                 raise ValueError('Downloaded input hash mismatch (partial preserved): ' + f['path'])
             partial.rename(path)
